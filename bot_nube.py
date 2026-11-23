@@ -90,7 +90,9 @@ def cleanup_expired():
     global active_cloud_reminders
     still_active = []
     for r in active_cloud_reminders:
-      if r["target_time"] > now:
+      # Mantenemos un pequeño margen de 120s tras vencer para que la vista móvil
+      # pueda mostrar la notificación grande aunque el polling sea cada pocos segundos
+      if r["target_time"] + 120 > now:
         still_active.append(r)
       else:
         expired_items.append(r)
@@ -108,18 +110,13 @@ def cleanup_expired():
 def schedule_removal(reminder_id, delay_seconds, task, category, created_at):
   def worker():
     time.sleep(max(0.0, delay_seconds))
+    record_history_item(task, category, status="Cumplido", created_at=created_at)
+    time.sleep(120)
     with state_lock:
       global active_cloud_reminders
-      found = None
-      remaining = []
-      for r in active_cloud_reminders:
-        if r["id"] == reminder_id:
-          found = r
-        else:
-          remaining.append(r)
-      active_cloud_reminders = remaining
-    if found:
-      record_history_item(task, category, status="Cumplido", created_at=created_at)
+      active_cloud_reminders = [
+          r for r in active_cloud_reminders if r["id"] != reminder_id
+      ]
 
   threading.Thread(target=worker, daemon=True).start()
 
@@ -205,9 +202,81 @@ PHONE_HTML = """
     .color-cat { color: #67e8f9; font-weight: 700; }
     .color-time { color: #f472b6; font-weight: 600; }
     .sep { color: #9ca3af; margin: 0 5px; }
+
+    /* Aviso grande en pantalla */
+    .alert-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(10, 10, 20, 0.86);
+      z-index: 9999;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .alert-backdrop.show {
+      display: flex;
+    }
+    .alert-box {
+      width: 100%;
+      max-width: 420px;
+      background: #2b2645;
+      border: 2px solid #fde047;
+      border-radius: 16px;
+      padding: 24px 20px;
+      text-align: center;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.6);
+      animation: popIn 0.2s ease-out;
+    }
+    @keyframes popIn {
+      from { transform: scale(0.9); opacity: 0; }
+      to { transform: scale(1); opacity: 1; }
+    }
+    .alert-badge {
+      display: inline-block;
+      background: #1e1e2f;
+      color: #67e8f9;
+      font-weight: 700;
+      font-size: 0.9rem;
+      padding: 6px 14px;
+      border-radius: 999px;
+      margin-bottom: 12px;
+    }
+    .alert-title {
+      font-size: 1.1rem;
+      color: #f472b6;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .alert-task {
+      font-size: 1.65rem;
+      line-height: 1.25;
+      color: #fde047;
+      font-weight: 800;
+      margin: 10px 0 20px;
+      word-break: break-word;
+    }
+    .alert-btn {
+      background: #22c55e;
+      color: #0f172a;
+      font-weight: 800;
+      font-size: 1.05rem;
+      padding: 13px;
+      border-radius: 10px;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
+  <div id="alertModal" class="alert-backdrop" role="dialog" aria-modal="true">
+    <div class="alert-box">
+      <div id="alertCat" class="alert-badge">Alta Demanda</div>
+      <div class="alert-title">¡ES HORA DE TU RECORDATORIO!</div>
+      <div id="alertTask" class="alert-task">Tarea</div>
+      <button id="alertDismiss" class="alert-btn" type="button" onclick="dismissAlert()">Entendido</button>
+    </div>
+  </div>
+
   <div class="card">
     <h1>Recordatorios (Móvil)</h1>
     <form id="remForm">
@@ -248,6 +317,82 @@ PHONE_HTML = """
   </div>
 
   <script>
+    const NOTIFIED_KEY = 'notified_reminder_ids_v1';
+    let currentAlertId = null;
+    const alertQueue = [];
+
+    function getNotifiedSet() {
+      try {
+        const raw = JSON.parse(localStorage.getItem(NOTIFIED_KEY) || '[]');
+        return new Set(Array.isArray(raw) ? raw : []);
+      } catch (_) {
+        return new Set();
+      }
+    }
+
+    function markNotified(id) {
+      const set = getNotifiedSet();
+      set.add(id);
+      const arr = Array.from(set).slice(-200);
+      localStorage.setItem(NOTIFIED_KEY, JSON.stringify(arr));
+    }
+
+    function playBeep() {
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        const ctx = new AudioCtx();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        gain.gain.setValueAtTime(0.15, ctx.currentTime);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.35);
+      } catch (_) {}
+    }
+
+    function showNextAlert() {
+      if (currentAlertId || !alertQueue.length) return;
+      const next = alertQueue.shift();
+      currentAlertId = next.id;
+      document.getElementById('alertCat').textContent = next.category || 'Recordatorio';
+      document.getElementById('alertTask').textContent = next.task;
+      document.getElementById('alertModal').classList.add('show');
+      playBeep();
+      if (navigator.vibrate) {
+        navigator.vibrate([250, 120, 250]);
+      }
+    }
+
+    async function dismissAlert() {
+      const idToClear = currentAlertId;
+      currentAlertId = null;
+      document.getElementById('alertModal').classList.remove('show');
+      if (idToClear) {
+        try {
+          await fetch('/api/reminders/' + encodeURIComponent(idToClear), { method: 'DELETE' });
+        } catch (_) {}
+      }
+      await refreshAll();
+      showNextAlert();
+    }
+
+    function checkDueReminders(items) {
+      const nowSec = Date.now() / 1000;
+      const notified = getNotifiedSet();
+      for (const r of items) {
+        if (!r || !r.id || notified.has(r.id)) continue;
+        if (typeof r.target_time === 'number' && nowSec >= r.target_time) {
+          markNotified(r.id);
+          alertQueue.push(r);
+        }
+      }
+      showNextAlert();
+    }
+
     function escapeHtml(text) {
       const div = document.createElement('div');
       div.textContent = text || '';
@@ -257,6 +402,8 @@ PHONE_HTML = """
     async function loadActive() {
       const res = await fetch('/api/reminders');
       const items = await res.json();
+      checkDueReminders(items);
+
       const container = document.getElementById('list');
       container.innerHTML = '';
       if (!items.length) {
@@ -301,6 +448,7 @@ PHONE_HTML = """
     }
 
     async function removeItem(id) {
+      markNotified(id);
       await fetch('/api/reminders/' + encodeURIComponent(id), { method: 'DELETE' });
       await refreshAll();
     }
@@ -330,7 +478,7 @@ PHONE_HTML = """
     }
 
     refreshAll();
-    setInterval(refreshAll, 5000);
+    setInterval(refreshAll, 2000);
   </script>
 </body>
 </html>
